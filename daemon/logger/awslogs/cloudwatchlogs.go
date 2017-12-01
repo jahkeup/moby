@@ -393,6 +393,7 @@ func (l *logStream) collectBatch() {
 	var events []wrappedEvent
 	var eventBuffer []byte
 	var eventBufferTimestamp int64
+	var batchBytes int
 	for {
 		select {
 		case t := <-timer.C:
@@ -402,16 +403,17 @@ func (l *logStream) collectBatch() {
 				eventBufferExpired := eventBufferAge > int64(batchPublishFrequency)/int64(time.Millisecond)
 				eventBufferNegative := eventBufferAge < 0
 				if eventBufferExpired || eventBufferNegative {
-					events = l.processEvent(events, eventBuffer, eventBufferTimestamp)
+					events, batchBytes = l.processEvent(events, eventBuffer, eventBufferTimestamp, batchBytes)
 					eventBuffer = eventBuffer[:0]
 				}
 			}
 			l.publishBatch(events)
 			events = events[:0]
+			batchBytes = 0
 		case msg, more := <-l.messages:
 			if !more {
 				// Flush event buffer and release resources
-				events = l.processEvent(events, eventBuffer, eventBufferTimestamp)
+				events, batchBytes = l.processEvent(events, eventBuffer, eventBufferTimestamp, batchBytes)
 				eventBuffer = eventBuffer[:0]
 				l.publishBatch(events)
 				events = events[:0]
@@ -425,7 +427,7 @@ func (l *logStream) collectBatch() {
 				if l.multilinePattern.Match(unprocessedLine) || len(eventBuffer)+len(unprocessedLine) > maximumBytesPerEvent {
 					// This is a new log event or we will exceed max bytes per event
 					// so flush the current eventBuffer to events and reset timestamp
-					events = l.processEvent(events, eventBuffer, eventBufferTimestamp)
+					events, batchBytes = l.processEvent(events, eventBuffer, eventBufferTimestamp, batchBytes)
 					eventBufferTimestamp = msg.Timestamp.UnixNano() / int64(time.Millisecond)
 					eventBuffer = eventBuffer[:0]
 				}
@@ -434,7 +436,7 @@ func (l *logStream) collectBatch() {
 				eventBuffer = append(eventBuffer, processedLine...)
 				logger.PutMessage(msg)
 			} else {
-				events = l.processEvent(events, unprocessedLine, msg.Timestamp.UnixNano()/int64(time.Millisecond))
+				events, batchBytes = l.processEvent(events, unprocessedLine, msg.Timestamp.UnixNano()/int64(time.Millisecond), batchBytes)
 				logger.PutMessage(msg)
 			}
 		}
@@ -450,8 +452,7 @@ func (l *logStream) collectBatch() {
 // bytes per event (defined in maximumBytesPerEvent).  There is a fixed per-event
 // byte overhead (defined in perEventBytes) which is accounted for in split- and
 // batch-calculations.
-func (l *logStream) processEvent(events []wrappedEvent, unprocessedLine []byte, timestamp int64) []wrappedEvent {
-	bytes := 0
+func (l *logStream) processEvent(events []wrappedEvent, unprocessedLine []byte, timestamp int64, batchBytes int) ([]wrappedEvent, int) {
 	for len(unprocessedLine) > 0 {
 		// Split line length so it does not exceed the maximum
 		lineBytes := len(unprocessedLine)
@@ -460,12 +461,12 @@ func (l *logStream) processEvent(events []wrappedEvent, unprocessedLine []byte, 
 		}
 		line := unprocessedLine[:lineBytes]
 		unprocessedLine = unprocessedLine[lineBytes:]
-		if (len(events) >= maximumLogEventsPerPut) || (bytes+lineBytes+perEventBytes > maximumBytesPerPut) {
+		if (len(events) >= maximumLogEventsPerPut) || (batchBytes+lineBytes+perEventBytes > maximumBytesPerPut) {
 			// Publish an existing batch if it's already over the maximum number of events or if adding this
 			// event would push it over the maximum number of total bytes.
 			l.publishBatch(events)
 			events = events[:0]
-			bytes = 0
+			batchBytes = 0
 		}
 		events = append(events, wrappedEvent{
 			inputLogEvent: &cloudwatchlogs.InputLogEvent{
@@ -474,9 +475,9 @@ func (l *logStream) processEvent(events []wrappedEvent, unprocessedLine []byte, 
 			},
 			insertOrder: len(events),
 		})
-		bytes += (lineBytes + perEventBytes)
+		batchBytes += (lineBytes + perEventBytes)
 	}
-	return events
+	return events, batchBytes
 }
 
 // publishBatch calls PutLogEvents for a given set of InputLogEvents,
